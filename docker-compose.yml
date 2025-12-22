@@ -1,0 +1,93 @@
+services:
+  db:
+    image: postgres:16
+    container_name: cloud_drive_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cloud_drive
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  control_plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cloud-drive-backend:latest
+    container_name: cloud_drive_backend
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/cloud_drive
+      SECRET_KEY: supersecretdevkey
+      ACCESS_TOKEN_EXPIRE_MINUTES: 60
+      ALGORITHM: HS256
+    ports:
+      - "8000:8000"
+
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    image: node1:latest
+    container_name: node1
+    ports:
+      - "9001:8000"
+    volumes:
+      - node1_data:/data/chunks
+
+  node2:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    image: node2:latest
+    container_name: node2
+    ports:
+      - "9002:8000"
+    volumes:
+      - node2_data:/data/chunks
+
+  node3:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    image: node3:latest
+    container_name: node3
+    ports:
+      - "9003:8000"
+    volumes:
+      - node3_data:/data/chunks
+
+  node4:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    image: node4:latest
+    container_name: node4
+    ports:
+      - "9004:8000"
+    volumes:
+      - node4_data:/data/chunks
+
+  node5:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    image: node5:latest
+    container_name: node5
+    ports:
+      - "9005:8000"
+    volumes:
+      - node5_data:/data/chunks
+
+volumes:
+  db_data:
+  node1_data:
+  node2_data:
+  node3_data:
+  node4_data:
+  node5_data:
+
+
