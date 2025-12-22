@@ -5,3 +5,4 @@ from control_plane.models.node import Node
 from control_plane.models.file import File
 from control_plane.models.chunk import Chunk  
 from control_plane.models.chunk_locations import ChunkLocation 
+from control_plane.models.file_versions import FileVersion

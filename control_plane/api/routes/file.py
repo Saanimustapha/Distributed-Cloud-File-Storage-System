@@ -14,10 +14,13 @@ from control_plane.models.file import File as FileModel
 from control_plane.models.user import User
 from control_plane.api.routes.auth import get_current_user
 from control_plane.schemas.file import FileRead
+from control_plane.schemas.file_version import FileVersionRead
+from control_plane.schemas.file_upload import FileUploadResponse
 # from control_plane.services.storage_client import upload_chunk_to_node  
 from control_plane.models.node import Node
 from control_plane.models.chunk import Chunk
 from control_plane.models.chunk_locations import ChunkLocation
+from control_plane.models.file_versions import FileVersion
 from control_plane.services.storage_client import (
     select_nodes_for_chunk_consistent,
     replicate_chunk,
@@ -26,83 +29,86 @@ from control_plane.services.storage_client import (
 router = APIRouter(prefix="/files", tags=["files"])
 
 
-@router.post("/upload", response_model=FileRead)
-def upload_file_chunked(
+@router.post("/upload", response_model=FileUploadResponse)
+def upload_file(
     file: UploadFile = File(...),
-    folder_id: Optional[int] = Query(
-        default=None,
-        description="Optional folder id to associate this file with",
-    ),
+    folder_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Phase 4 upload with consistent hashing:
-
-    - Create File row (size 0 initially).
-    - Read input file in fixed-size chunks (CHUNK_SIZE_BYTES).
-    - For each chunk:
-      - Generate chunk_id (UUID string).
-      - Use consistent hashing on chunk_id to select replication nodes.
-      - Upload to those nodes & record Chunk + ChunkLocation.
-    - Update total file size.
-    """
-    chunk_size = settings.CHUNK_SIZE_BYTES
-
-    content_type = file.content_type or "application/octet-stream"
-    db_file = FileModel(
-        name=file.filename or "unnamed",
-        size_bytes=0,
-        content_type=content_type,
-        owner_id=current_user.id,
-        folder_id=folder_id,
-        node_id=None,
-        chunk_id=None,
+    # 1. Find or create File
+    db_file = (
+        db.query(FileModel)
+        .filter(
+            FileModel.name == file.filename,
+            FileModel.owner_id == current_user.id,
+            FileModel.folder_id == folder_id,
+        )
+        .first()
     )
-    db.add(db_file)
-    db.commit()
-    db.refresh(db_file)
 
+    if not db_file:
+        db_file = FileModel(
+            name=file.filename,
+            owner_id=current_user.id,
+            folder_id=folder_id,
+        )
+        db.add(db_file)
+        db.commit()
+        db.refresh(db_file)
+
+    # 2. Determine next version number
+    latest_version = (
+        db.query(FileVersion)
+        .filter(FileVersion.file_id == db_file.id)
+        .order_by(FileVersion.version_number.desc())
+        .first()
+    )
+
+    next_version = 1 if not latest_version else latest_version.version_number + 1
+
+    # 3. Create FileVersion
+    version = FileVersion(
+        file_id=db_file.id,
+        version_number=next_version,
+        size_bytes=0,
+    )
+    db.add(version)
+    db.commit()
+    db.refresh(version)
+
+    # 4. Chunk + replicate
     total_size = 0
     index = 0
+    chunk_size = settings.CHUNK_SIZE_BYTES
 
     while True:
-        chunk_data = file.file.read(chunk_size)
-        if not chunk_data:
+        data = file.file.read(chunk_size)
+        if not data:
             break
 
-        total_size += len(chunk_data)
-
-        # Generate a stable ID for this chunk
         chunk_id = str(uuid.uuid4())
+        nodes = select_nodes_for_chunk_consistent(chunk_id, db)
 
-        # Consistent hashing: which nodes should store this chunk?
-        nodes = select_nodes_for_chunk_consistent(chunk_id=chunk_id, db=db)
-
-        # Upload & record metadata
         replicate_chunk(
             db=db,
-            file_id=db_file.id,
+            file_version_id=version.id,
             index=index,
             chunk_id=chunk_id,
-            data=chunk_data,
+            data=data,
             nodes=nodes,
         )
 
+        total_size += len(data)
         index += 1
 
-    if index == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty",
-        )
-
-    db_file.size_bytes = total_size
+    version.size_bytes = total_size
     db.commit()
-    db.refresh(db_file)
 
-    return db_file
-
+    return {
+    "file": db_file,
+    "version": version,
+    }
 
 
 
@@ -110,9 +116,11 @@ def upload_file_chunked(
 @router.get("/{file_id}/download")
 def download_file(
     file_id: int,
+    version: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # 1. Validate file ownership
     db_file = (
         db.query(FileModel)
         .filter(
@@ -121,24 +129,47 @@ def download_file(
         )
         .first()
     )
+
     if not db_file:
         raise HTTPException(status_code=404, detail="File not found")
 
+    # 2. Select file version
+    if version is None:
+        # latest version (versions are ordered desc)
+        if not db_file.versions:
+            raise HTTPException(status_code=404, detail="No versions found for file")
+        file_version = db_file.versions[0]
+    else:
+        file_version = (
+            db.query(FileVersion)
+            .filter(
+                FileVersion.file_id == db_file.id,
+                FileVersion.version_number == version,
+            )
+            .first()
+        )
+
+    if not file_version:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    # 3. Load chunks in correct order
     chunks = (
         db.query(Chunk)
-        .filter(Chunk.file_id == db_file.id)
+        .filter(Chunk.file_version_id == file_version.id)
         .order_by(Chunk.index.asc())
         .all()
     )
+
     if not chunks:
         raise HTTPException(
             status_code=500,
-            detail="No chunks found for file",
+            detail="No chunks found for this file version",
         )
 
-    def iter_file_bytes():
+    # 4. Stream chunks sequentially with replica failover
+    def stream_file_bytes():
         for chunk in chunks:
-            # find all online replicas for this chunk
+            # Fetch all ONLINE replicas for this chunk
             locations = (
                 db.query(ChunkLocation)
                 .join(Node, ChunkLocation.node_id == Node.id)
@@ -155,38 +186,61 @@ def download_file(
                     detail=f"No online replicas available for chunk {chunk.index}",
                 )
 
-            success = False
+            chunk_served = False
 
-            for loc in locations:
-                node = loc.node
+            # Try replicas in order
+            for location in locations:
+                node = location.node
                 url = f"{node.base_url.rstrip('/')}/chunks/{chunk.id}"
 
                 try:
-                    with httpx.stream("GET", url, timeout=30.0) as resp:
-                        if resp.status_code != 200:
-                            # try next replica
+                    with httpx.stream("GET", url, timeout=30.0) as response:
+                        if response.status_code != 200:
                             continue
 
-                        for data in resp.iter_bytes():
+                        for data in response.iter_bytes():
                             if data:
                                 yield data
 
-                        success = True
+                        chunk_served = True
                         break
 
                 except httpx.RequestError:
-                    # try next replica
+                    # Try next replica
                     continue
 
-            if not success:
+            if not chunk_served:
                 raise HTTPException(
                     status_code=502,
                     detail=f"All replicas failed for chunk {chunk.index}",
                 )
 
-    media_type = db_file.content_type or "application/octet-stream"
+    # 5. Return streaming response
+    media_type = "application/octet-stream"
     headers = {
         "Content-Disposition": f'attachment; filename="{db_file.name}"'
     }
 
-    return StreamingResponse(iter_file_bytes(), media_type=media_type, headers=headers)
+    return StreamingResponse(
+        stream_file_bytes(),
+        media_type=media_type,
+        headers=headers,
+    )
+
+
+@router.get("/{file_id}/versions", response_model=list[FileVersionRead])
+def list_versions(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return (
+        db.query(FileVersion)
+        .join(FileModel)
+        .filter(
+            FileModel.id == file_id,
+            FileModel.owner_id == current_user.id,
+        )
+        .order_by(FileVersion.version_number.desc())
+        .all()
+    )

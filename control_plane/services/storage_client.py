@@ -92,7 +92,7 @@ def select_nodes_for_chunk_consistent(
 
 def replicate_chunk(
     db: Session,
-    file_id: int,
+    file_version_id: int,
     index: int,
     chunk_id: str,
     data: bytes,
@@ -109,7 +109,7 @@ def replicate_chunk(
     # 1) Create Chunk row
     chunk = Chunk(
         id=chunk_id,
-        file_id=file_id,
+        file_version_id=file_version_id,
         index=index,
         size_bytes=size_bytes,
     )
