@@ -21,6 +21,7 @@ from control_plane.models.node import Node
 from control_plane.models.chunk import Chunk
 from control_plane.models.chunk_locations import ChunkLocation
 from control_plane.models.file_versions import FileVersion
+from control_plane.models.file_permission import FilePermission
 from control_plane.services.storage_client import (
     select_nodes_for_chunk_consistent,
     replicate_chunk,
@@ -56,6 +57,15 @@ def upload_file(
         db.add(db_file)
         db.commit()
         db.refresh(db_file)
+
+        owner_permission = FilePermission(
+        file_id=db_file.id,
+        user_id=current_user.id,
+        role="owner",
+        )
+        
+        db.add(owner_permission)
+        db.commit()
 
     # 2. Determine next version number
     latest_version = (
