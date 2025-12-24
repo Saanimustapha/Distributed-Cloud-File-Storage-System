@@ -16,12 +16,14 @@ from control_plane.api.routes.auth import get_current_user
 from control_plane.schemas.file import FileRead
 from control_plane.schemas.file_version import FileVersionRead
 from control_plane.schemas.file_upload import FileUploadResponse
+from control_plane.schemas.file_permission import ShareFileRequest
 # from control_plane.services.storage_client import upload_chunk_to_node  
 from control_plane.models.node import Node
 from control_plane.models.chunk import Chunk
 from control_plane.models.chunk_locations import ChunkLocation
 from control_plane.models.file_versions import FileVersion
 from control_plane.models.file_permission import FilePermission
+from control_plane.services.permissions import get_file_for_user
 from control_plane.services.storage_client import (
     select_nodes_for_chunk_consistent,
     replicate_chunk,
@@ -66,6 +68,13 @@ def upload_file(
         
         db.add(owner_permission)
         db.commit()
+
+    get_file_for_user(
+        db=db,
+        file_id=db_file.id,
+        user_id=current_user.id,
+        required_role="write",
+    )
 
     # 2. Determine next version number
     latest_version = (
@@ -131,13 +140,19 @@ def download_file(
     current_user: User = Depends(get_current_user),
 ):
     # 1. Validate file ownership
-    db_file = (
-        db.query(FileModel)
-        .filter(
-            FileModel.id == file_id,
-            FileModel.owner_id == current_user.id,
-        )
-        .first()
+    # db_file = (
+    #     db.query(FileModel)
+    #     .filter(
+    #         FileModel.id == file_id,
+    #         FileModel.owner_id == current_user.id,
+    #     )
+    #     .first()
+    # )
+    db_file = get_file_for_user(
+    db=db,
+    file_id=file_id,
+    user_id=current_user.id,
+    required_role="read",
     )
 
     if not db_file:
@@ -238,19 +253,85 @@ def download_file(
     )
 
 
+
 @router.get("/{file_id}/versions", response_model=list[FileVersionRead])
 def list_versions(
     file_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # ✅ Permission check first (shared users with read/write/owner should pass)
+    get_file_for_user(
+        db=db,
+        file_id=file_id,
+        user_id=current_user.id,
+        required_role="read",
+    )
+
+    # ✅ Then return versions (no owner_id filter needed)
     return (
         db.query(FileVersion)
-        .join(FileModel)
-        .filter(
-            FileModel.id == file_id,
-            FileModel.owner_id == current_user.id,
-        )
+        .filter(FileVersion.file_id == file_id)
         .order_by(FileVersion.version_number.desc())
         .all()
     )
+
+
+@router.post("/{file_id}/share")
+def share_file(
+    file_id: int,
+    payload: ShareFileRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Owner check
+    get_file_for_user(
+        db=db,
+        file_id=file_id,
+        user_id=current_user.id,
+        required_role="owner",
+    )
+
+    permission = (
+        db.query(FilePermission)
+        .filter(
+            FilePermission.file_id == file_id,
+            FilePermission.user_id == payload.user_id,
+        )
+        .first()
+    )
+
+    if permission:
+        permission.role = payload.role
+    else:
+        permission = FilePermission(
+            file_id=file_id,
+            user_id=payload.user_id,
+            role=payload.role,
+        )
+        db.add(permission)
+
+    db.commit()
+
+    return {"message": "File shared successfully"}
+
+
+@router.get("/{file_id}/permissions")
+def list_permissions(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    get_file_for_user(
+        db=db,
+        file_id=file_id,
+        user_id=current_user.id,
+        required_role="owner",
+    )
+
+    return (
+        db.query(FilePermission)
+        .filter(FilePermission.file_id == file_id)
+        .all()
+    )
+
