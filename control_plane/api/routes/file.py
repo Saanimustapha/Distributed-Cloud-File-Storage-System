@@ -132,6 +132,87 @@ def upload_file(
 
 
 
+@router.post("/{file_id}/versions", response_model=FileVersionRead, status_code=status.HTTP_201_CREATED)
+def upload_new_version(
+    file_id: int,
+    upload: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Upload a new version for an existing file.
+    - Requires WRITE permission (owner/write).
+    - Creates a new FileVersion.
+    - Splits the uploaded content into chunks.
+    - Stores each chunk on R nodes using consistent hashing + replication.
+    """
+
+    # 1) Permission check: must be allowed to edit this file
+    file_obj: FileModel = get_file_for_user(
+        db=db,
+        file_id=file_id,
+        user_id=current_user.id,
+        required_role="write",
+    )
+
+    # 2) Determine next version number for this file
+    latest_version = (
+        db.query(FileVersion)
+        .filter(FileVersion.file_id == file_obj.id)
+        .order_by(FileVersion.version_number.desc())
+        .first()
+    )
+    next_version = 1 if not latest_version else latest_version.version_number + 1
+
+    # 3) Create FileVersion row (size filled after upload)
+    version = FileVersion(
+        file_id=file_obj.id,
+        version_number=next_version,
+        size_bytes=0,
+    )
+    db.add(version)
+    db.commit()
+    db.refresh(version)
+
+    # 4) Chunk + replicate
+    total_size = 0
+    index = 0
+    chunk_size = settings.CHUNK_SIZE_BYTES
+
+    while True:
+        data = upload.file.read(chunk_size)
+        if not data:
+            break
+
+        chunk_id = str(uuid.uuid4())
+
+        # Consistent hashing decides primary+replicas for THIS chunk_id
+        nodes = select_nodes_for_chunk_consistent(chunk_id=chunk_id, db=db)
+
+        replicate_chunk(
+            db=db,
+            file_version_id=version.id,
+            index=index,
+            chunk_id=chunk_id,
+            data=data,
+            nodes=nodes,
+        )
+
+        total_size += len(data)
+        index += 1
+
+    if index == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    # 5) Update version size
+    version.size_bytes = total_size
+    db.commit()
+    db.refresh(version)
+
+    return version
+
+
+
 @router.get("/{file_id}/download")
 def download_file(
     file_id: int,

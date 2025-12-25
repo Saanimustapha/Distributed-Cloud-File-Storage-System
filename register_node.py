@@ -159,4 +159,4 @@ if __name__ == "__main__":
 
 # python register_node.py --backend-url http://localhost:8000 --email mdsaani@gmail.com --password saanipass --name node1 --base-url http://node1:8000
 
- python register_node.py  --backend-url http://localhost:8000 --email mdsaani@gmail.com  --password saanipass  --name  node5  --base-url http://node5:8000  
+#  python register_node.py  --backend-url http://localhost:8000 --email mdsaani@gmail.com  --password saanipass  --name  node5  --base-url http://node5:8000  
