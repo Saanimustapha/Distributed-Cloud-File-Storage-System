@@ -416,3 +416,40 @@ def list_permissions(
         .all()
     )
 
+
+@router.delete("/{file_id}/delete", status_code=status.HTTP_200_OK)
+def delete_file(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # 1) File must exist
+    file_obj = db.query(FileModel).filter(FileModel.id == file_id).first()
+    if not file_obj:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # 2) Only OWNER can delete
+    perm = (
+        db.query(FilePermission)
+        .filter(
+            FilePermission.file_id == file_id,
+            FilePermission.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if not perm or perm.role != "owner":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the file owner can delete this file",
+        )
+
+    # 3) Delete the file record
+    # IMPORTANT:
+    # - If you set cascading correctly on relationships / foreign keys,
+    #   versions/chunks/locations/permissions will delete automatically.
+    db.delete(file_obj)
+    db.commit()
+
+    return {"message": "File deleted successfully"}
+

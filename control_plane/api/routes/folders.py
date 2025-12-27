@@ -1,11 +1,13 @@
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import exists
 
 from control_plane.db.session import get_db
 from control_plane.models.folder import Folder
 from control_plane.models.user import User
+from control_plane.models.file import File as FileModel
 from control_plane.schemas.folder import FolderCreate, FolderRead
 from control_plane.api.routes.auth import get_current_user
 
@@ -68,7 +70,7 @@ def delete_folder(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Make sure the folder exists and belongs to the current user
+    # 1) Folder must exist and belong to current user
     folder = (
         db.query(Folder)
         .filter(
@@ -77,18 +79,30 @@ def delete_folder(
         )
         .first()
     )
-
     if not folder:
         raise HTTPException(status_code=404, detail="Folder not found")
 
-    #Recursively delete all children
-    def delete_recursively(f: Folder):
-        # Make a copy of the list to avoid modification during iteration
-        for child in list(f.children):
-            delete_recursively(child)
-        db.delete(f)
+    # 2) Reject deletion if folder still contains files
+    has_files = db.query(
+        exists().where(FileModel.folder_id == folder_id)
+    ).scalar()
 
-    delete_recursively(folder)
+    if has_files:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Folder is not empty. Move or delete files first.",
+        )
+
+    # also reject if folder contains subfolders, if you support nesting
+    has_subfolders = db.query(exists().where(Folder.parent_id == folder_id)).scalar()
+    if has_subfolders:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Folder contains subfolders. Delete/move them first.",
+        )
+
+    # 3) Delete the folder
+    db.delete(folder)
     db.commit()
 
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return {"message": "Folder deleted successfully"}
