@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from typing import List
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Cloud Drive Backend"
@@ -8,6 +9,7 @@ class Settings(BaseSettings):
     ALGORITHM: str
     CHUNK_SIZE_BYTES: int = 1048576
     REPLICATION_FACTOR: int = 3
+    CORS_ORIGINS: List[str] = ["http://localhost:5173"]
 
     class Config:
         env_file = ".env"
