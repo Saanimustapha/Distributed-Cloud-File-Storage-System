@@ -1,10 +1,11 @@
 # app/api/routes/files.py
 
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, File, UploadFile, Query, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import and_, func
 import httpx
 import uuid
 
@@ -14,6 +15,7 @@ from control_plane.models.file import File as FileModel
 from control_plane.models.user import User
 from control_plane.api.routes.auth import get_current_user
 from control_plane.schemas.file import FileRead
+from control_plane.schemas.file_permission import FileShareRead
 from control_plane.schemas.file_version import FileVersionRead
 from control_plane.schemas.file_upload import FileUploadResponse
 from control_plane.schemas.file_permission import ShareFileRequest
@@ -23,6 +25,7 @@ from control_plane.models.chunk import Chunk
 from control_plane.models.chunk_locations import ChunkLocation
 from control_plane.models.file_versions import FileVersion
 from control_plane.models.file_permission import FilePermission
+from control_plane.schemas.file_list import FileListItem
 from control_plane.services.permissions import get_file_for_user
 from control_plane.services.storage_client import (
     select_nodes_for_chunk_consistent,
@@ -453,3 +456,282 @@ def delete_file(
 
     return {"message": "File deleted successfully"}
 
+
+
+@router.get("/all", response_model=List[FileListItem])
+def list_my_files(
+    folder_id: Optional[int] = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List files owned by the current user in a folder.
+    If folder_id is null -> list files in root (folder_id IS NULL).
+    Includes latest version metadata for UI.
+    """
+
+    # Subquery to get the max version_number for each file_id
+    latest_vn_sq = (
+        db.query(
+            FileVersion.file_id.label("file_id"),
+            func.max(FileVersion.version_number).label("max_vn"),
+        )
+        .group_by(FileVersion.file_id)
+        .subquery()
+    )
+
+    # Join file_versions to get metadata for that max version per file
+    latest_version_sq = (
+        db.query(
+            FileVersion.file_id.label("file_id"),
+            FileVersion.version_number.label("latest_version_number"),
+            FileVersion.size_bytes.label("latest_version_size_bytes"),
+            FileVersion.created_at.label("latest_version_created_at"),
+        )
+        .join(
+            latest_vn_sq,
+            and_(
+                FileVersion.file_id == latest_vn_sq.c.file_id,
+                FileVersion.version_number == latest_vn_sq.c.max_vn,
+            ),
+        )
+        .subquery()
+    )
+
+    q = (
+        db.query(
+            FileModel.id,
+            FileModel.name,
+            FileModel.folder_id,
+            FileModel.owner_id,
+            FileModel.created_at,
+            FileModel.updated_at,
+            latest_version_sq.c.latest_version_number,
+            latest_version_sq.c.latest_version_size_bytes,
+            latest_version_sq.c.latest_version_created_at,
+        )
+        .outerjoin(latest_version_sq, latest_version_sq.c.file_id == FileModel.id)
+        .filter(FileModel.owner_id == current_user.id)
+    )
+
+    if folder_id is None:
+        q = q.filter(FileModel.folder_id.is_(None))
+    else:
+        q = q.filter(FileModel.folder_id == folder_id)
+
+    rows = q.order_by(FileModel.updated_at.desc()).all()
+
+    # Convert SQLAlchemy row tuples to dicts
+    return [
+        {
+            "id": r.id,
+            "name": r.name,
+            "folder_id": r.folder_id,
+            "owner_id": r.owner_id,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+            "latest_version_number": r.latest_version_number,
+            "latest_version_size_bytes": r.latest_version_size_bytes,
+            "latest_version_created_at": r.latest_version_created_at,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/shared", response_model=List[FileListItem])
+def list_shared_files(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List files shared with the current user (has permission) but not owned.
+    Includes latest version metadata for UI.
+    """
+
+    latest_vn_sq = (
+        db.query(
+            FileVersion.file_id.label("file_id"),
+            func.max(FileVersion.version_number).label("max_vn"),
+        )
+        .group_by(FileVersion.file_id)
+        .subquery()
+    )
+
+    latest_version_sq = (
+        db.query(
+            FileVersion.file_id.label("file_id"),
+            FileVersion.version_number.label("latest_version_number"),
+            FileVersion.size_bytes.label("latest_version_size_bytes"),
+            FileVersion.created_at.label("latest_version_created_at"),
+        )
+        .join(
+            latest_vn_sq,
+            and_(
+                FileVersion.file_id == latest_vn_sq.c.file_id,
+                FileVersion.version_number == latest_vn_sq.c.max_vn,
+            ),
+        )
+        .subquery()
+    )
+
+    q = (
+        db.query(
+            FileModel.id,
+            FileModel.name,
+            FileModel.folder_id,
+            FileModel.owner_id,
+            FileModel.created_at,
+            FileModel.updated_at,
+            latest_version_sq.c.latest_version_number,
+            latest_version_sq.c.latest_version_size_bytes,
+            latest_version_sq.c.latest_version_created_at,
+            FilePermission.role.label("my_role"),  
+        )
+        .join(FilePermission, FilePermission.file_id == FileModel.id)
+        .outerjoin(latest_version_sq, latest_version_sq.c.file_id == FileModel.id)
+        .filter(FilePermission.user_id == current_user.id)
+        .filter(FileModel.owner_id != current_user.id)
+    )
+
+    rows = q.order_by(FileModel.updated_at.desc()).all()
+
+    return [
+        {
+            "id": r.id,
+            "name": r.name,
+            "folder_id": r.folder_id,
+            "owner_id": r.owner_id,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+            "latest_version_number": r.latest_version_number,
+            "latest_version_size_bytes": r.latest_version_size_bytes,
+            "latest_version_created_at": r.latest_version_created_at,
+            "my_role": r.my_role, 
+        }
+        for r in rows
+    ]
+
+
+@router.get("/shared-by-me", response_model=List[FileListItem])
+def list_files_shared_by_me(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List files owned by current user that have been shared with at least one other user.
+    """
+
+    # Latest version per file
+    latest_vn_sq = (
+        db.query(
+            FileVersion.file_id.label("file_id"),
+            func.max(FileVersion.version_number).label("max_vn"),
+        )
+        .group_by(FileVersion.file_id)
+        .subquery()
+    )
+
+    latest_version_sq = (
+        db.query(
+            FileVersion.file_id.label("file_id"),
+            FileVersion.version_number.label("latest_version_number"),
+            FileVersion.size_bytes.label("latest_version_size_bytes"),
+            FileVersion.created_at.label("latest_version_created_at"),
+        )
+        .join(
+            latest_vn_sq,
+            and_(
+                FileVersion.file_id == latest_vn_sq.c.file_id,
+                FileVersion.version_number == latest_vn_sq.c.max_vn,
+            ),
+        )
+        .subquery()
+    )
+
+    # Count collaborators (exclude owner)
+    collaborators_sq = (
+        db.query(
+            FilePermission.file_id.label("file_id"),
+            func.count(FilePermission.user_id).label("collaborator_count"),
+        )
+        .join(FileModel, FileModel.id == FilePermission.file_id)
+        .filter(FileModel.owner_id == current_user.id)
+        .filter(FilePermission.user_id != current_user.id)
+        .group_by(FilePermission.file_id)
+        .subquery()
+    )
+
+    q = (
+        db.query(
+            FileModel.id,
+            FileModel.name,
+            FileModel.folder_id,
+            FileModel.owner_id,
+            FileModel.created_at,
+            FileModel.updated_at,
+            latest_version_sq.c.latest_version_number,
+            latest_version_sq.c.latest_version_size_bytes,
+            latest_version_sq.c.latest_version_created_at,
+            collaborators_sq.c.collaborator_count,
+        )
+        .outerjoin(latest_version_sq, latest_version_sq.c.file_id == FileModel.id)
+        .join(collaborators_sq, collaborators_sq.c.file_id == FileModel.id)  # ensures shared with others
+        .filter(FileModel.owner_id == current_user.id)
+        .order_by(FileModel.updated_at.desc())
+    )
+
+    rows = q.all()
+
+    return [
+        {
+            "id": r.id,
+            "name": r.name,
+            "folder_id": r.folder_id,
+            "owner_id": r.owner_id,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+            "latest_version_number": r.latest_version_number,
+            "latest_version_size_bytes": r.latest_version_size_bytes,
+            "latest_version_created_at": r.latest_version_created_at,
+            "collaborator_count": r.collaborator_count,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/{file_id}/shares-by-me", response_model=List[FileShareRead])
+def list_file_shares(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List everyone this file has been shared with (and their roles).
+    Owner-only.
+    """
+    # Owner check
+    get_file_for_user(
+        db=db,
+        file_id=file_id,
+        user_id=current_user.id,
+        required_role="owner",
+    )
+
+    rows = (
+        db.query(FilePermission, User)
+        .join(User, User.id == FilePermission.user_id)
+        .filter(FilePermission.file_id == file_id)
+        .filter(User.id != current_user.id)  # exclude owner from list (optional)
+        .order_by(User.email.asc())
+        .all()
+    )
+
+    return [
+        {
+            "user_id": user.id,
+            "email": user.email,
+            "role": perm.role,
+            "shared_at": perm.created_at,
+        }
+        for perm, user in rows
+    ]
