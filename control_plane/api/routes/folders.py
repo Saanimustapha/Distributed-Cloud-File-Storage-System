@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
@@ -14,23 +14,54 @@ from control_plane.api.routes.auth import get_current_user
 router = APIRouter(prefix="/folders", tags=["folders"])
 
 
+# @router.get("/all", response_model=List[FolderRead])
+# def list_folders(
+#     page: int = Query(1, ge=1, description="Page number (starting from 1)"),
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user),
+# ):
+#     PAGE_SIZE = 10
+#     skip = (page - 1) * PAGE_SIZE
+    
+#     folders = (
+#         db.query(Folder)
+#         .filter(Folder.owner_id == current_user.id)
+#         .order_by(Folder.created_at.desc())
+#         .offset(skip) 
+#         .limit(PAGE_SIZE)
+#         .all()
+#     )
+#     return folders
+
 @router.get("/all", response_model=List[FolderRead])
 def list_folders(
     page: int = Query(1, ge=1, description="Page number (starting from 1)"),
+    parent_id: Optional[int] = Query(
+        None, description="Parent folder ID (optional)"
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     PAGE_SIZE = 10
     skip = (page - 1) * PAGE_SIZE
-    
-    folders = (
+
+    query = (
         db.query(Folder)
         .filter(Folder.owner_id == current_user.id)
+    )
+
+    # 👇 apply filter only if parent_id is provided
+    if parent_id is not None:
+        query = query.filter(Folder.parent_id == parent_id)
+
+    folders = (
+        query
         .order_by(Folder.created_at.desc())
-        .offset(skip) 
+        .offset(skip)
         .limit(PAGE_SIZE)
         .all()
     )
+
     return folders
 
 
