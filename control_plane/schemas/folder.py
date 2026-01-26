@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class FolderBase(BaseModel):
@@ -18,3 +18,7 @@ class FolderRead(FolderBase):
 
     class Config:
         from_attributes = True
+
+class FolderRename(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+

@@ -8,7 +8,7 @@ from control_plane.db.session import get_db
 from control_plane.models.folder import Folder
 from control_plane.models.user import User
 from control_plane.models.file import File as FileModel
-from control_plane.schemas.folder import FolderCreate, FolderRead
+from control_plane.schemas.folder import FolderCreate, FolderRead, FolderRename
 from control_plane.api.routes.auth import get_current_user
 
 router = APIRouter(prefix="/folders", tags=["folders"])
@@ -90,6 +90,57 @@ def create_folder(
         parent_id=payload.parent_id,
     )
     db.add(folder)
+    db.commit()
+    db.refresh(folder)
+    return folder
+
+
+@router.patch("/{folder_id}/rename", response_model=FolderRead, status_code=status.HTTP_200_OK)
+def rename_folder(
+    folder_id: int,
+    payload: FolderRename,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    new_name = payload.name.strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Folder name cannot be empty")
+
+    # 1) Folder must exist and belong to user
+    folder = (
+        db.query(Folder)
+        .filter(
+            Folder.id == folder_id,
+            Folder.owner_id == current_user.id,
+        )
+        .first()
+    )
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    # 2) No-op
+    if folder.name == new_name:
+        return folder
+
+    # 3) Prevent duplicates at the same level (same parent_id)
+    existing = (
+        db.query(Folder)
+        .filter(
+            Folder.owner_id == current_user.id,
+            Folder.parent_id == folder.parent_id,   # same folder level
+            Folder.name == new_name,
+            Folder.id != folder.id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Folder with that name already exists here",
+        )
+
+    # 4) Update
+    folder.name = new_name
     db.commit()
     db.refresh(folder)
     return folder
