@@ -36,9 +36,7 @@ router = APIRouter(prefix="/folders", tags=["folders"])
 @router.get("/all", response_model=List[FolderRead])
 def list_folders(
     page: int = Query(1, ge=1, description="Page number (starting from 1)"),
-    parent_id: Optional[int] = Query(
-        None, description="Parent folder ID (optional)"
-    ),
+    parent_id: Optional[int] = Query(None, description="Parent folder ID (optional)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -50,8 +48,10 @@ def list_folders(
         .filter(Folder.owner_id == current_user.id)
     )
 
-    # 👇 apply filter only if parent_id is provided
-    if parent_id is not None:
+    # ✅ root-only when omitted, else children-of-parent
+    if parent_id is None:
+        query = query.filter(Folder.parent_id.is_(None))
+    else:
         query = query.filter(Folder.parent_id == parent_id)
 
     folders = (
@@ -63,6 +63,7 @@ def list_folders(
     )
 
     return folders
+
 
 
 @router.post("/create", response_model=FolderRead, status_code=status.HTTP_201_CREATED)
@@ -188,3 +189,33 @@ def delete_folder(
     db.commit()
 
     return {"message": "Folder deleted successfully"}
+
+#Get folder path
+@router.get("/{folder_id}/path")
+def get_folder_path(
+    folder_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # returns [{id, name}, {id, name}, ...] from root -> current
+    folder = db.query(Folder).filter(
+        Folder.id == folder_id,
+        Folder.owner_id == current_user.id
+    ).first()
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    path = []
+    cur = folder
+    # walk up parents
+    while cur is not None:
+        path.append({"id": cur.id, "name": cur.name, "parent_id": cur.parent_id})
+        if cur.parent_id is None:
+            break
+        cur = db.query(Folder).filter(
+            Folder.id == cur.parent_id,
+            Folder.owner_id == current_user.id
+        ).first()
+
+    path.reverse()
+    return path
