@@ -29,6 +29,8 @@ from control_plane.models.file_versions import FileVersion
 from control_plane.models.file_permission import FilePermission
 from control_plane.schemas.file_list import FileListItem
 from control_plane.services.permissions import get_file_for_user
+from control_plane.models.notification import Notification
+from control_plane.services.web_socket_manager import ws_manager
 from control_plane.services.storage_client import (
     select_nodes_for_chunk_consistent,
     replicate_chunk,
@@ -364,7 +366,7 @@ def list_versions(
 
 
 @router.post("/{file_id}/share")
-def share_file(
+async def share_file(
     file_id: int,
     payload: ShareFileRequest,
     db: Session = Depends(get_db),
@@ -398,6 +400,33 @@ def share_file(
         db.add(permission)
 
     db.commit()
+
+    # create notification row for recipient
+    note = Notification(
+        user_id=payload.user_id,
+        type="file_shared",
+        message=f"A file was shared with you from {current_user.email}",
+        file_id=file_id,
+        actor_user_id=current_user.id,
+        is_read=False,
+    )
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+
+    # push realtime
+    await ws_manager.send_to_user(payload.user_id, {
+        "event": "notification",
+        "notification": {
+            "id": note.id,
+            "type": note.type,
+            "message": note.message,
+            "file_id": note.file_id,
+            "actor_user_id": note.actor_user_id,
+            "is_read": note.is_read,
+            "created_at": note.created_at,
+        }
+    })
 
     return {"message": "File shared successfully"}
 
