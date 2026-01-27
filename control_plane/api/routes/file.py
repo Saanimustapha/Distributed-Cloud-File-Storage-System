@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_, func
 import httpx
 import uuid
+import mimetypes
+
 
 from control_plane.core.config import settings
 from control_plane.db.session import get_db
@@ -735,3 +737,99 @@ def list_file_shares(
         }
         for perm, user in rows
     ]
+
+
+@router.get("/{file_id}/view")
+def view_file(
+    file_id: int,
+    version: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    db_file = get_file_for_user(
+        db=db,
+        file_id=file_id,
+        user_id=current_user.id,
+        required_role="read",
+    )
+
+    if not db_file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Select version
+    if version is None:
+        if not db_file.versions:
+            raise HTTPException(status_code=404, detail="No versions found for file")
+        file_version = db_file.versions[0]
+    else:
+        file_version = (
+            db.query(FileVersion)
+            .filter(
+                FileVersion.file_id == db_file.id,
+                FileVersion.version_number == version,
+            )
+            .first()
+        )
+        if not file_version:
+            raise HTTPException(status_code=404, detail="Version not found")
+
+    chunks = (
+        db.query(Chunk)
+        .filter(Chunk.file_version_id == file_version.id)
+        .order_by(Chunk.index.asc())
+        .all()
+    )
+    if not chunks:
+        raise HTTPException(status_code=500, detail="No chunks found for this file version")
+
+    def stream_file_bytes():
+        for chunk in chunks:
+            locations = (
+                db.query(ChunkLocation)
+                .join(Node, ChunkLocation.node_id == Node.id)
+                .filter(
+                    ChunkLocation.chunk_id == chunk.id,
+                    Node.is_online.is_(True),
+                )
+                .all()
+            )
+            if not locations:
+                raise HTTPException(status_code=503, detail=f"No online replicas for chunk {chunk.index}")
+
+            served = False
+            for location in locations:
+                node = location.node
+                url = f"{node.base_url.rstrip('/')}/chunks/{chunk.id}"
+
+                try:
+                    with httpx.stream("GET", url, timeout=30.0) as response:
+                        if response.status_code != 200:
+                            continue
+
+                        for data in response.iter_bytes():
+                            if data:
+                                yield data
+
+                        served = True
+                        break
+
+                except httpx.RequestError:
+                    continue
+
+            if not served:
+                raise HTTPException(status_code=502, detail=f"All replicas failed for chunk {chunk.index}")
+
+    # ✅ Guess correct content type from filename
+    content_type, _ = mimetypes.guess_type(db_file.name)
+    media_type = content_type or "application/octet-stream"
+
+    headers = {
+        # ✅ INLINE so browsers can preview PDFs/images/etc.
+        "Content-Disposition": f'inline; filename="{db_file.name}"'
+    }
+
+    return StreamingResponse(
+        stream_file_bytes(),
+        media_type=media_type,
+        headers=headers,
+    )
