@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     CHUNK_SIZE_BYTES: int = 1048576
     REPLICATION_FACTOR: int = 3
     CORS_ORIGINS: List[str] = ["http://localhost:5173"]
+    GOOGLE_CLIENT_ID: str | None = None
 
     class Config:
         env_file = ".env"

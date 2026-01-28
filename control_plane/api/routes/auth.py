@@ -11,6 +11,16 @@ from control_plane.db.session import get_db
 from control_plane.models.user import User
 from control_plane.schemas.user import UserCreate, UserRead
 from control_plane.schemas.auth import Token, TokenData
+from control_plane.schemas.google_auth import GoogleLoginRequest
+
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
+
+import secrets
+
+random_pw = secrets.token_urlsafe(32)
+hashed = hash_password(random_pw)
+
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -23,6 +33,7 @@ def register_user(payload: UserCreate, db: Session = Depends(get_db)):
 
     user = User(
         email=payload.email,
+        username=payload.username,
         hashed_password=hash_password(payload.password),
     )
     db.add(user)
@@ -79,3 +90,53 @@ def get_current_user(
     if user is None:
         raise credentials_exception
     return user
+
+@router.post("/google")
+def google_login(
+    payload: GoogleLoginRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        idinfo = google_id_token.verify_oauth2_token(
+            payload.id_token,
+            google_requests.Request(),
+            settings.GOOGLE_CLIENT_ID,
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+
+    # Recommended checks
+    if idinfo.get("iss") not in ["accounts.google.com", "https://accounts.google.com"]:
+        raise HTTPException(status_code=401, detail="Invalid token issuer")
+
+    if not idinfo.get("email"):
+        raise HTTPException(status_code=400, detail="Google token missing email")
+
+    # Optional but recommended:
+    if idinfo.get("email_verified") is False:
+        raise HTTPException(status_code=401, detail="Email not verified by Google")
+
+    email = idinfo["email"].lower().strip()
+    google_sub = idinfo.get("sub")  # Google's stable user id
+
+    # 1) Find user by email
+    user = db.query(User).filter(User.email == email).first()
+
+    # 2) Create user if not exists
+    if not user:
+        random_pw = secrets.token_urlsafe(32)
+        user = User(
+            email=email,
+            username=email.split("@")[0], 
+            hashed_password=hash_password(random_pw),  
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    # 3) Issue your normal JWT for the app (same as password login)
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(subject=user.id, expires_delta=access_token_expires)
+    return Token(access_token=access_token)
+
+

@@ -13,6 +13,7 @@ class UserCreate(UserBase):
 
 class UserRead(UserBase):
     id: int
+    username: str
     created_at: datetime
 
     class Config:
