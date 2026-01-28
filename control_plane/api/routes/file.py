@@ -30,6 +30,7 @@ from control_plane.models.file_permission import FilePermission
 from control_plane.schemas.file_list import FileListItem
 from control_plane.services.permissions import get_file_for_user
 from control_plane.models.notification import Notification
+from control_plane.schemas.file_rename import FileRename
 from control_plane.services.web_socket_manager import ws_manager
 from control_plane.services.storage_client import (
     select_nodes_for_chunk_consistent,
@@ -862,3 +863,49 @@ def view_file(
         media_type=media_type,
         headers=headers,
     )
+
+@router.patch("/{file_id}/rename", response_model=FileRead, status_code=status.HTTP_200_OK)
+def rename_file(
+    file_id: int,
+    payload: FileRename,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    new_name = payload.name.strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="File name cannot be empty")
+
+    # Must have WRITE permission (owner/write)
+    file_obj: FileModel = get_file_for_user(
+        db=db,
+        file_id=file_id,
+        user_id=current_user.id,
+        required_role="write",
+    )
+
+    # No-op
+    if file_obj.name == new_name:
+        return file_obj
+
+    # Prevent duplicate names in same folder for the OWNER
+    # (since name uniqueness is defined by owner_id + folder_id + name in your upload logic)
+    existing = (
+        db.query(FileModel)
+        .filter(
+            FileModel.owner_id == file_obj.owner_id,
+            FileModel.folder_id == file_obj.folder_id,
+            FileModel.name == new_name,
+            FileModel.id != file_obj.id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="A file with that name already exists in this folder",
+        )
+
+    file_obj.name = new_name
+    db.commit()
+    db.refresh(file_obj)
+    return file_obj
