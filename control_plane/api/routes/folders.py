@@ -219,3 +219,28 @@ def get_folder_path(
 
     path.reverse()
     return path
+
+
+@router.get("/{folder_id}/can-delete", response_model=dict)
+def can_delete_folder(
+    folder_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    folder = (
+        db.query(Folder)
+        .filter(Folder.id == folder_id, Folder.owner_id == current_user.id)
+        .first()
+    )
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    has_files = db.query(exists().where(FileModel.folder_id == folder_id)).scalar()
+    has_subfolders = db.query(exists().where(Folder.parent_id == folder_id)).scalar()
+
+    return {
+        "can_delete": (not has_files and not has_subfolders),
+        "has_files": bool(has_files),
+        "has_subfolders": bool(has_subfolders),
+    }
+
