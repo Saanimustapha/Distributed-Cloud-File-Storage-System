@@ -9,4 +9,7 @@ class SkippedFolder(BaseModel):
 class BulkDeleteResult(BaseModel):
     deleted_files: int
     deleted_folders: int
-    skipped_folders: List[SkippedFolder]
+
+class DeleteFolderTreeResult(BaseModel):
+    deleted_files: int
+    deleted_folders: int

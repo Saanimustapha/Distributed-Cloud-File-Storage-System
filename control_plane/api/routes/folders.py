@@ -2,74 +2,45 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import exists
+from sqlalchemy import exists, delete
+from sqlalchemy.exc import SQLAlchemyError
 
 from control_plane.db.session import get_db
 from control_plane.models.folder import Folder
 from control_plane.models.user import User
 from control_plane.models.file import File as FileModel
+from control_plane.models.chunk import Chunk
+from control_plane.models.chunk_locations import ChunkLocation
+from control_plane.models.file_versions import FileVersion
 from control_plane.schemas.folder import FolderCreate, FolderRead, FolderRename
 from control_plane.schemas.folder_bulk_delete import BulkDeleteResult, SkippedFolder
+from control_plane.schemas.folder_bulk_delete import DeleteFolderTreeResult
 from control_plane.api.routes.auth import get_current_user
+
 
 router = APIRouter(prefix="/folders", tags=["folders"])
 
 
-def subtree_has_any_files(db: Session, folder_id: int, owner_id: int) -> bool:
-    """True if this folder OR ANY descendant folder contains files owned by the user."""
-    direct = (
-        db.query(exists().where(
-            FileModel.folder_id == folder_id,
-            FileModel.owner_id == owner_id,
-        ))
-        .scalar()
-    )
-    if direct:
-        return True
-
-    child_ids = [
-        r[0]
-        for r in db.query(Folder.id)
-        .filter(Folder.parent_id == folder_id, Folder.owner_id == owner_id)
-        .all()
-    ]
-    for cid in child_ids:
-        if subtree_has_any_files(db, cid, owner_id):
-            return True
-    return False
-
-
-def delete_empty_subtree(
-    db: Session,
-    folder_obj: Folder,
-    owner_id: int,
-    skipped: list,
-    deleted_folders_counter: dict,
-) -> bool:
+def get_descendant_folder_ids(db: Session, root_folder_id: int, owner_id: int) -> list[int]:
     """
-    Deletes folder_obj and ALL its descendants only if the whole subtree has NO files.
-    Returns True if deleted, False if skipped.
+    Returns ALL descendant folder ids (any depth), NOT including root_folder_id.
     """
-    if subtree_has_any_files(db, folder_obj.id, owner_id):
-        skipped.append(SkippedFolder(
-            id=folder_obj.id,
-            name=folder_obj.name,
-            reason="Folder subtree contains files",
-        ))
-        return False
+    result: list[int] = []
+    stack = [root_folder_id]
 
-    # Post-order delete: delete children first
-    children = (
-        db.query(Folder)
-        .filter(Folder.parent_id == folder_obj.id, Folder.owner_id == owner_id)
-        .all()
-    )
-    for child in children:
-        delete_empty_subtree(db, child, owner_id, skipped, deleted_folders_counter)
+    while stack:
+        parent = stack.pop()
+        children = (
+            db.query(Folder.id)
+            .filter(Folder.parent_id == parent, Folder.owner_id == owner_id)
+            .all()
+        )
+        child_ids = [c[0] for c in children]
+        result.extend(child_ids)
+        stack.extend(child_ids)
 
-    db.delete(folder_obj)
-    deleted_folders_counter["count"] += 1
-    return True
+    return result
+
 
 
 # @router.get("/all", response_model=List[FolderRead])
@@ -280,28 +251,111 @@ def get_folder_path(
     return path
 
 
-@router.get("/{folder_id}/can-delete", response_model=dict)
-def can_delete_folder(
+@router.delete("/{folder_id}/delete-tree")
+def delete_folder_tree(
     folder_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ):
-    folder = (
-        db.query(Folder)
-        .filter(Folder.id == folder_id, Folder.owner_id == current_user.id)
-        .first()
-    )
-    if not folder:
-        raise HTTPException(status_code=404, detail="Folder not found")
+    try:
+        # Ensure folder exists & owned
+        root = (
+            db.query(Folder)
+            .filter(Folder.id == folder_id, Folder.owner_id == current_user.id)
+            .first()
+        )
+        if not root:
+            raise HTTPException(status_code=404, detail="Folder not found")
 
-    has_files = db.query(exists().where(FileModel.folder_id == folder_id)).scalar()
-    has_subfolders = db.query(exists().where(Folder.parent_id == folder_id)).scalar()
+        # 1) Collect ALL folder ids in subtree (including root)
+        stack = [folder_id]
+        folder_ids: list[int] = []
 
-    return {
-        "can_delete": (not has_files and not has_subfolders),
-        "has_files": bool(has_files),
-        "has_subfolders": bool(has_subfolders),
-    }
+        while stack:
+            fid = stack.pop()
+            folder_ids.append(fid)
+
+            child_ids = [
+                r[0]
+                for r in db.query(Folder.id)
+                .filter(Folder.parent_id == fid, Folder.owner_id == current_user.id)
+                .all()
+            ]
+            stack.extend(child_ids)
+
+        # 2) Collect ALL files in subtree folders (INCLUDING ROOT FOLDER FILES)
+        file_ids = [
+            r[0]
+            for r in db.query(FileModel.id)
+            .filter(FileModel.owner_id == current_user.id)
+            .filter(FileModel.folder_id.in_(folder_ids))
+            .all()
+        ]
+
+        deleted_files = len(file_ids)
+        deleted_folders = 0
+
+        # 3) Delete file dependencies first
+        if file_ids:
+            version_ids = [
+                r[0]
+                for r in db.query(FileVersion.id)
+                .filter(FileVersion.file_id.in_(file_ids))
+                .all()
+            ]
+
+            if version_ids:
+                chunk_ids = [
+                    r[0]
+                    for r in db.query(Chunk.id)
+                    .filter(Chunk.file_version_id.in_(version_ids))
+                    .all()
+                ]
+
+                if chunk_ids:
+                    db.query(ChunkLocation).filter(
+                        ChunkLocation.chunk_id.in_(chunk_ids)
+                    ).delete(synchronize_session=False)
+
+                    db.query(Chunk).filter(
+                        Chunk.id.in_(chunk_ids)
+                    ).delete(synchronize_session=False)
+
+                db.query(FileVersion).filter(
+                    FileVersion.id.in_(version_ids)
+                ).delete(synchronize_session=False)
+
+            # If you have file shares/collaborators table, delete those too:
+            # db.query(FileShare).filter(FileShare.file_id.in_(file_ids)).delete(synchronize_session=False)
+
+            # 4) Delete files
+            db.query(FileModel).filter(
+                FileModel.id.in_(file_ids),
+                FileModel.owner_id == current_user.id,
+            ).delete(synchronize_session=False)
+
+            # ✅ Force DB to apply deletions before folders are removed
+            db.flush()
+
+        # 5) Delete folders bottom-up (children first)
+        for fid in reversed(folder_ids):
+            db.query(Folder).filter(
+                Folder.id == fid,
+                Folder.owner_id == current_user.id,
+            ).delete(synchronize_session=False)
+            deleted_folders += 1
+
+        db.commit()
+
+        return {
+            "deleted_files": deleted_files,
+            "deleted_folders": deleted_folders,
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        msg = str(e.orig) if hasattr(e, "orig") else str(e)
+        raise HTTPException(status_code=500, detail=f"Delete failed: {msg}")
 
 
 @router.delete("/{folder_id}/delete-all-items", response_model=BulkDeleteResult)
@@ -318,35 +372,48 @@ def delete_all_items_in_folder(
     if not root:
         raise HTTPException(status_code=404, detail="Folder not found")
 
-    deleted_files_count = 0
-    skipped: list[SkippedFolder] = []
-    deleted_folders_counter = {"count": 0}
+    owner_id = current_user.id
 
-    # 1) Delete files directly inside THIS folder (not recursive)
-    files = (
-        db.query(FileModel)
-        .filter(FileModel.folder_id == folder_id, FileModel.owner_id == current_user.id)
+    # 1) collect descendant folders (any depth)
+    descendant_ids = get_descendant_folder_ids(db, folder_id, owner_id)
+
+    # include root folder id? NO (we want to keep current folder)
+    all_folder_ids = descendant_ids
+
+    # 2) delete files in root folder + descendant folders
+    folder_ids_for_files = [folder_id] + descendant_ids
+
+    files_to_delete = (
+        db.query(FileModel.id)
+        .filter(FileModel.owner_id == owner_id)
+        .filter(FileModel.folder_id.in_(folder_ids_for_files))
         .all()
     )
-    deleted_files_count = len(files)
-    for f in files:
-        db.delete(f)
+    deleted_files_count = len(files_to_delete)
 
-    # 2) Delete child folder subtrees if they contain NO files anywhere
-    top_children = (
-        db.query(Folder)
-        .filter(Folder.parent_id == folder_id, Folder.owner_id == current_user.id)
-        .all()
+    db.execute(
+        delete(FileModel).where(
+            FileModel.owner_id == owner_id,
+            FileModel.folder_id.in_(folder_ids_for_files),
+        )
     )
-    for child in top_children:
-        delete_empty_subtree(db, child, current_user.id, skipped, deleted_folders_counter)
+
+    # 3) delete folders bottom-up (deepest first)
+    # delete descendants only (not the root folder itself)
+    deleted_folders_count = len(descendant_ids)
+    if descendant_ids:
+        db.execute(
+            delete(Folder).where(
+                Folder.owner_id == owner_id,
+                Folder.id.in_(descendant_ids),
+            )
+        )
 
     db.commit()
 
     return BulkDeleteResult(
         deleted_files=deleted_files_count,
-        deleted_folders=deleted_folders_counter["count"],
-        skipped_folders=skipped,
+        deleted_folders=deleted_folders_count,
     )
 
 
@@ -355,36 +422,70 @@ def delete_all_items_in_root(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    deleted_files_count = 0
-    skipped: list[SkippedFolder] = []
-    deleted_folders_counter = {"count": 0}
+    owner_id = current_user.id
 
-    # 1) Delete root files (folder_id is NULL)
-    root_files = (
-        db.query(FileModel)
-        .filter(FileModel.owner_id == current_user.id)
+    # 1) delete root files (folder_id NULL)
+    root_file_ids = (
+        db.query(FileModel.id)
+        .filter(FileModel.owner_id == owner_id)
         .filter(FileModel.folder_id.is_(None))
         .all()
     )
-    deleted_files_count = len(root_files)
-    for f in root_files:
-        db.delete(f)
+    deleted_root_files = len(root_file_ids)
 
-    # 2) Delete root folder subtrees if they contain NO files anywhere
+    db.execute(
+        delete(FileModel).where(
+            FileModel.owner_id == owner_id,
+            FileModel.folder_id.is_(None),
+        )
+    )
+
+    # 2) get root folders
     root_folders = (
-        db.query(Folder)
-        .filter(Folder.owner_id == current_user.id)
+        db.query(Folder.id)
+        .filter(Folder.owner_id == owner_id)
         .filter(Folder.parent_id.is_(None))
         .all()
     )
+    root_folder_ids = [r[0] for r in root_folders]
 
-    for folder in root_folders:
-        delete_empty_subtree(db, folder, current_user.id, skipped, deleted_folders_counter)
+    # 3) collect ALL descendant folders for all root folders
+    all_descendants: list[int] = []
+    for fid in root_folder_ids:
+        all_descendants.extend(get_descendant_folder_ids(db, fid, owner_id))
+
+    all_folders_to_delete = root_folder_ids + all_descendants
+    deleted_folders_count = len(all_folders_to_delete)
+
+    # 4) delete ALL files in ANY of those folders
+    deleted_files_in_folders = 0
+    if all_folders_to_delete:
+        files_in_folders = (
+            db.query(FileModel.id)
+            .filter(FileModel.owner_id == owner_id)
+            .filter(FileModel.folder_id.in_(all_folders_to_delete))
+            .all()
+        )
+        deleted_files_in_folders = len(files_in_folders)
+
+        db.execute(
+            delete(FileModel).where(
+                FileModel.owner_id == owner_id,
+                FileModel.folder_id.in_(all_folders_to_delete),
+            )
+        )
+
+        # 5) delete folders (root + descendants)
+        db.execute(
+            delete(Folder).where(
+                Folder.owner_id == owner_id,
+                Folder.id.in_(all_folders_to_delete),
+            )
+        )
 
     db.commit()
 
     return BulkDeleteResult(
-        deleted_files=deleted_files_count,
-        deleted_folders=deleted_folders_counter["count"],
-        skipped_folders=skipped,
+        deleted_files=deleted_root_files + deleted_files_in_folders,
+        deleted_folders=deleted_folders_count,
     )
