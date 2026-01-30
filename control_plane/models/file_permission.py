@@ -31,6 +31,8 @@ class FilePermission(Base):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    last_opened_at = Column(DateTime(timezone=True), nullable=True)
+
     __table_args__ = (
         UniqueConstraint("file_id", "user_id", name="uq_file_user_permission"),
     )

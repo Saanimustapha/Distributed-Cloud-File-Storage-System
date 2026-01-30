@@ -16,6 +16,9 @@ class FileListItem(BaseModel):
 
     collaborator_count: Optional[int] = None
 
+    unseen: bool = False
+    last_opened_at: Optional[datetime] = None
+
     created_at: datetime
     updated_at: datetime
 

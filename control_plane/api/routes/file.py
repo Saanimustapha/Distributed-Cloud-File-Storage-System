@@ -5,10 +5,11 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, File, UploadFile, Query, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, func
+from sqlalchemy import and_, func, exists, case, or_
 import httpx
 import uuid
 import mimetypes
+from datetime import datetime, timezone
 
 
 from control_plane.core.config import settings
@@ -578,6 +579,8 @@ def list_shared_files(
     """
     List files shared with the current user (has permission) but not owned.
     Includes latest version metadata for UI.
+    Adds:
+      - unseen: bool  (true if user hasn't opened latest version)
     """
 
     latest_vn_sq = (
@@ -606,6 +609,20 @@ def list_shared_files(
         .subquery()
     )
 
+    unseen_expr = case(
+        (
+            or_(
+                FilePermission.last_opened_at.is_(None),
+                and_(
+                    latest_version_sq.c.latest_version_created_at.isnot(None),
+                    latest_version_sq.c.latest_version_created_at > FilePermission.last_opened_at,
+                ),
+            ),
+            True,
+        ),
+        else_=False,
+    ).label("unseen")
+
     q = (
         db.query(
             FileModel.id,
@@ -617,7 +634,9 @@ def list_shared_files(
             latest_version_sq.c.latest_version_number,
             latest_version_sq.c.latest_version_size_bytes,
             latest_version_sq.c.latest_version_created_at,
-            FilePermission.role.label("my_role"),  
+            FilePermission.role.label("my_role"),
+            FilePermission.last_opened_at.label("last_opened_at"),
+            unseen_expr,  
         )
         .join(FilePermission, FilePermission.file_id == FileModel.id)
         .outerjoin(latest_version_sq, latest_version_sq.c.file_id == FileModel.id)
@@ -625,7 +644,14 @@ def list_shared_files(
         .filter(FileModel.owner_id != current_user.id)
     )
 
-    rows = q.order_by(FileModel.updated_at.desc()).all()
+    rows = (
+        q.order_by(
+            unseen_expr.desc(),
+            latest_version_sq.c.latest_version_created_at.desc().nullslast(),
+            FileModel.updated_at.desc(),
+        )
+        .all()
+    )
 
     return [
         {
@@ -638,7 +664,9 @@ def list_shared_files(
             "latest_version_number": r.latest_version_number,
             "latest_version_size_bytes": r.latest_version_size_bytes,
             "latest_version_created_at": r.latest_version_created_at,
-            "my_role": r.my_role, 
+            "my_role": r.my_role,
+            "unseen": bool(r.unseen),
+            "last_opened_at": r.last_opened_at,
         }
         for r in rows
     ]
@@ -909,3 +937,25 @@ def rename_file(
     db.commit()
     db.refresh(file_obj)
     return file_obj
+
+
+@router.post("/{file_id}/mark-opened")
+def mark_file_opened(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    perm = (
+        db.query(FilePermission)
+        .filter(FilePermission.file_id == file_id, FilePermission.user_id == current_user.id)
+        .first()
+    )
+    if not perm:
+        # not a shared file for this user -> ignore
+        return {"ok": True}
+
+    perm.last_opened_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"ok": True}
+
+
