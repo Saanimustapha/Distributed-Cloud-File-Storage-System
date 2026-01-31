@@ -374,63 +374,89 @@ async def share_file(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Owner check
-    get_file_for_user(
+    # 1) Owner check
+    file_obj = get_file_for_user(
         db=db,
         file_id=file_id,
         user_id=current_user.id,
         required_role="owner",
     )
 
-    permission = (
-        db.query(FilePermission)
-        .filter(
-            FilePermission.file_id == file_id,
-            FilePermission.user_id == payload.user_id,
-        )
-        .first()
-    )
+    # 2) Validate recipients
+    user_ids = list({int(x) for x in payload.user_ids})  # dedupe
+    if not user_ids:
+        raise HTTPException(status_code=400, detail="user_ids cannot be empty")
 
-    if permission:
-        permission.role = payload.role
-    else:
-        permission = FilePermission(
+    if current_user.id in user_ids:
+        # optional: allow skipping self rather than error
+        user_ids = [uid for uid in user_ids if uid != current_user.id]
+
+    if not user_ids:
+        raise HTTPException(status_code=400, detail="No valid recipients")
+
+    # 3) Make sure all users exist
+    users = db.query(User).filter(User.id.in_(user_ids)).all()
+    found_ids = {u.id for u in users}
+    missing_ids = [uid for uid in user_ids if uid not in found_ids]
+
+    shared = []
+    skipped = [{"user_id": mid, "reason": "User not found"} for mid in missing_ids]
+
+    # 4) Upsert permissions + create notifications
+    notes_to_send = []  # (user_id, note_model)
+
+    for u in users:
+        # Upsert permission row
+        perm = (
+            db.query(FilePermission)
+            .filter(FilePermission.file_id == file_id, FilePermission.user_id == u.id)
+            .first()
+        )
+        if perm:
+            perm.role = payload.role
+        else:
+            perm = FilePermission(file_id=file_id, user_id=u.id, role=payload.role)
+            db.add(perm)
+
+        # Create notification
+        note = Notification(
+            user_id=u.id,
+            type="file_shared",
+            message=f"{current_user.email} shared “{file_obj.name}” with you",
             file_id=file_id,
-            user_id=payload.user_id,
-            role=payload.role,
+            actor_user_id=current_user.id,
+            is_read=False,
         )
-        db.add(permission)
+        db.add(note)
+        notes_to_send.append((u.id, note))
 
+        shared.append({"user_id": u.id, "role": payload.role})
+
+    # 5) Commit once (generates IDs + created_at)
     db.commit()
 
-    # create notification row for recipient
-    note = Notification(
-        user_id=payload.user_id,
-        type="file_shared",
-        message=f"A file was shared with you from {current_user.email}",
-        file_id=file_id,
-        actor_user_id=current_user.id,
-        is_read=False,
-    )
-    db.add(note)
-    db.commit()
-    db.refresh(note)
+    # 6) Websocket push for each note
+    for uid, note in notes_to_send:
+        await ws_manager.send_to_user(uid, {
+            "event": "notification",
+            "notification": {
+                "id": note.id,
+                "type": note.type,
+                "message": note.message,
+                "file_id": note.file_id,
+                "actor_user_id": note.actor_user_id,
+                "is_read": note.is_read,
+                "created_at": note.created_at,
+            }
+        })
 
-    # push realtime
-    await ws_manager.send_to_user(payload.user_id, {
-        "event": "notification",
-        "notification": {
-            "id": note.id,
-            "type": note.type,
-            "message": note.message,
-            "file_id": note.file_id,
-            "actor_user_id": note.actor_user_id,
-            "is_read": note.is_read,
-            "created_at": note.created_at,
-        }
-    })
-
-    return {"message": "File shared successfully"}
+    return {
+        "message": "File shared successfully",
+        "shared": shared,
+        "skipped": skipped,
+        "count_shared": len(shared),
+        "count_skipped": len(skipped),
+    }
 
 
 @router.get("/{file_id}/access")

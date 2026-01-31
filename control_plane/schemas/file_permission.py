@@ -1,10 +1,11 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
+from typing import List, Literal
 from datetime import datetime
 
 
 class ShareFileRequest(BaseModel):
-    user_id: int
-    role: str  # "read" or "write"
+    user_ids: List[int] = Field(..., min_length=1)
+    role: Literal["read", "write"]
 
 
 class FileShareRead(BaseModel):
