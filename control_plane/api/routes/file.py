@@ -433,6 +433,24 @@ async def share_file(
     return {"message": "File shared successfully"}
 
 
+@router.get("/{file_id}/access")
+def get_file_access(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    perm = (
+        db.query(FilePermission)
+        .filter(FilePermission.file_id == file_id, FilePermission.user_id == current_user.id)
+        .first()
+    )
+    if not perm:
+        raise HTTPException(status_code=403, detail="You do not have access to this file")
+
+    return {"role": perm.role}  # "read" | "write" | "owner"
+
+
+
 @router.get("/{file_id}/permissions")
 def list_permissions(
     file_id: int,
@@ -959,3 +977,35 @@ def mark_file_opened(
     return {"ok": True}
 
 
+@router.delete("/{file_id}/remove-from-shared", status_code=status.HTTP_204_NO_CONTENT)
+def remove_from_shared_with_me(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # file must exist
+    file_obj = db.query(FileModel).filter(FileModel.id == file_id).first()
+    if not file_obj:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Owner should NOT use this endpoint (owner has their own delete endpoint)
+    if file_obj.owner_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Owner cannot remove own file from shared list")
+
+    # Find permission row for THIS user
+    perm = (
+        db.query(FilePermission)
+        .filter(
+            FilePermission.file_id == file_id,
+            FilePermission.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not perm:
+        # If it's already removed, treat as success
+        return
+
+    # Remove only the share record (does not delete file)
+    db.delete(perm)
+    db.commit()
+    return
