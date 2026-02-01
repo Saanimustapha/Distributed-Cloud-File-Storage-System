@@ -1,7 +1,7 @@
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 from sqlalchemy import exists, delete
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -21,25 +21,32 @@ from control_plane.api.routes.auth import get_current_user
 router = APIRouter(prefix="/folders", tags=["folders"])
 
 
-def get_descendant_folder_ids(db: Session, root_folder_id: int, owner_id: int) -> list[int]:
-    """
-    Returns ALL descendant folder ids (any depth), NOT including root_folder_id.
-    """
-    result: list[int] = []
-    stack = [root_folder_id]
 
-    while stack:
-        parent = stack.pop()
-        children = (
+def get_descendant_folder_ids(db: Session, root_id: int, owner_id: int) -> List[int]:
+    """
+    Returns ALL descendant folder IDs (children, grandchildren, etc.) of root_id.
+    Does NOT include root_id itself.
+    """
+    descendants: list[int] = []
+    frontier: list[int] = [root_id]
+
+    while frontier:
+        child_rows = (
             db.query(Folder.id)
-            .filter(Folder.parent_id == parent, Folder.owner_id == owner_id)
+            .filter(
+                Folder.owner_id == owner_id,
+                Folder.parent_id.in_(frontier),
+            )
             .all()
         )
-        child_ids = [c[0] for c in children]
-        result.extend(child_ids)
-        stack.extend(child_ids)
+        child_ids = [r[0] for r in child_rows]
+        if not child_ids:
+            break
 
-    return result
+        descendants.extend(child_ids)
+        frontier = child_ids
+
+    return descendants
 
 
 
@@ -364,32 +371,27 @@ def delete_all_items_in_folder(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    owner_id = current_user.id
+
     root = (
         db.query(Folder)
-        .filter(Folder.id == folder_id, Folder.owner_id == current_user.id)
+        .filter(Folder.id == folder_id, Folder.owner_id == owner_id)
         .first()
     )
     if not root:
         raise HTTPException(status_code=404, detail="Folder not found")
 
-    owner_id = current_user.id
-
-    # 1) collect descendant folders (any depth)
     descendant_ids = get_descendant_folder_ids(db, folder_id, owner_id)
-
-    # include root folder id? NO (we want to keep current folder)
-    all_folder_ids = descendant_ids
-
-    # 2) delete files in root folder + descendant folders
     folder_ids_for_files = [folder_id] + descendant_ids
 
-    files_to_delete = (
+    deleted_files_count = (
         db.query(FileModel.id)
-        .filter(FileModel.owner_id == owner_id)
-        .filter(FileModel.folder_id.in_(folder_ids_for_files))
-        .all()
+        .filter(
+            FileModel.owner_id == owner_id,
+            FileModel.folder_id.in_(folder_ids_for_files),
+        )
+        .count()
     )
-    deleted_files_count = len(files_to_delete)
 
     db.execute(
         delete(FileModel).where(
@@ -398,16 +400,46 @@ def delete_all_items_in_folder(
         )
     )
 
-    # 3) delete folders bottom-up (deepest first)
-    # delete descendants only (not the root folder itself)
-    deleted_folders_count = len(descendant_ids)
-    if descendant_ids:
+    deleted_folders_count = 0
+    remaining = set(descendant_ids)
+
+    Child = aliased(Folder)
+
+    while remaining:
+        remaining_list = list(remaining)
+
+        # leaf folders: no child folder whose parent_id is this folder
+        leaf_ids = [
+            r[0]
+            for r in (
+                db.query(Folder.id)
+                .filter(
+                    Folder.owner_id == owner_id,
+                    Folder.id.in_(remaining_list),
+                    ~exists().where(
+                        (Child.owner_id == owner_id)
+                        & (Child.parent_id == Folder.id)
+                        & (Child.id.in_(remaining_list))
+                    ),
+                )
+                .all()
+            )
+        ]
+
+        if not leaf_ids:
+            # should never happen if remaining truly forms a tree,
+            # but prevents infinite loop if data is corrupted
+            break
+
         db.execute(
             delete(Folder).where(
                 Folder.owner_id == owner_id,
-                Folder.id.in_(descendant_ids),
+                Folder.id.in_(leaf_ids),
             )
         )
+
+        deleted_folders_count += len(leaf_ids)
+        remaining.difference_update(leaf_ids)
 
     db.commit()
 
@@ -427,8 +459,7 @@ def delete_all_items_in_root(
     # 1) delete root files (folder_id NULL)
     root_file_ids = (
         db.query(FileModel.id)
-        .filter(FileModel.owner_id == owner_id)
-        .filter(FileModel.folder_id.is_(None))
+        .filter(FileModel.owner_id == owner_id, FileModel.folder_id.is_(None))
         .all()
     )
     deleted_root_files = len(root_file_ids)
@@ -441,29 +472,30 @@ def delete_all_items_in_root(
     )
 
     # 2) get root folders
-    root_folders = (
+    root_folder_rows = (
         db.query(Folder.id)
-        .filter(Folder.owner_id == owner_id)
-        .filter(Folder.parent_id.is_(None))
+        .filter(Folder.owner_id == owner_id, Folder.parent_id.is_(None))
         .all()
     )
-    root_folder_ids = [r[0] for r in root_folders]
+    root_folder_ids = [r[0] for r in root_folder_rows]
 
-    # 3) collect ALL descendant folders for all root folders
-    all_descendants: list[int] = []
-    for fid in root_folder_ids:
-        all_descendants.extend(get_descendant_folder_ids(db, fid, owner_id))
+    # 3) collect ALL descendants for all root folders
+    folder_ids_to_delete: set[int] = set(root_folder_ids)
+    for rid in root_folder_ids:
+        folder_ids_to_delete.update(get_descendant_folder_ids(db, rid, owner_id))
 
-    all_folders_to_delete = root_folder_ids + all_descendants
-    deleted_folders_count = len(all_folders_to_delete)
+    folder_ids_list = list(folder_ids_to_delete)
+    deleted_folders_count = len(folder_ids_list)
 
     # 4) delete ALL files in ANY of those folders
     deleted_files_in_folders = 0
-    if all_folders_to_delete:
+    if folder_ids_list:
         files_in_folders = (
             db.query(FileModel.id)
-            .filter(FileModel.owner_id == owner_id)
-            .filter(FileModel.folder_id.in_(all_folders_to_delete))
+            .filter(
+                FileModel.owner_id == owner_id,
+                FileModel.folder_id.in_(folder_ids_list),
+            )
             .all()
         )
         deleted_files_in_folders = len(files_in_folders)
@@ -471,15 +503,15 @@ def delete_all_items_in_root(
         db.execute(
             delete(FileModel).where(
                 FileModel.owner_id == owner_id,
-                FileModel.folder_id.in_(all_folders_to_delete),
+                FileModel.folder_id.in_(folder_ids_list),
             )
         )
 
-        # 5) delete folders (root + descendants)
+        # 5) delete folders (now safe because ALL descendants are included)
         db.execute(
             delete(Folder).where(
                 Folder.owner_id == owner_id,
-                Folder.id.in_(all_folders_to_delete),
+                Folder.id.in_(folder_ids_list),
             )
         )
 
