@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from control_plane.api.routes import auth, folders, nodes, file, users, notifications
+from control_plane.api.routes import auth, folders, nodes, file, users, notifications, search
 from control_plane.db.session import engine
 from control_plane.db.base import Base  # ensures Base is imported
 import control_plane.models  # noqa: F401  # import models so metadata is populated
@@ -27,5 +27,6 @@ control_plane.include_router(nodes.router)
 control_plane.include_router(file.router)
 control_plane.include_router(users.router)
 control_plane.include_router(notifications.router)
+control_plane.include_router(search.router)
 
 
