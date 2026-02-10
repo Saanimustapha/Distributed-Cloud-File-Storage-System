@@ -188,7 +188,9 @@ Although storage nodes are Dockerized services, the design supports:
 - S3
 - MinIO
 
-After spinning the backend up, head over to the frontend readme via [Cloud_drive_frontend]([https://github.com](https://github.com/Saanimustapha/Distributed-Cloud-File-Storage-System-Frontend-/tree/main/cloud-drive-frontend))
+Only the data plane implementation would change.
+
+After spinning the backend up, head over to the frontend readme via [Cloud_drive_frontend](https://github.com/Saanimustapha/Distributed-Cloud-File-Storage-System-Frontend-)
 
 
 
